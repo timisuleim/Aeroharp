@@ -5,7 +5,11 @@ Runs MediaPipe hand tracking on every recorded gesture video and saves the
 hand landmark coordinates to a single CSV file that the classifier can train on.
 
 Each video produces one row per frame where a hand was detected, with:
-    gesture label, then 21 landmarks x (x, y, z) = 63 numbers per frame.
+    gesture label, clip_id (which video it came from), then 21 landmarks x (x, y, z).
+
+The clip_id column lets the classifier split train/test by whole video clips
+instead of by individual frames, which matters because frames from the same
+clip look nearly identical to each other (see train_classifier.py).
 
 Usage:
     python extract_landmarks.py
@@ -25,15 +29,15 @@ OUTPUT_FILE = "data/landmarks.csv"
 mp_hands = mp.solutions.hands
 
 
-def landmarks_to_row(hand_landmarks, gesture_label):
-    """Flattens MediaPipe's 21 hand landmarks into a single row: [label, x0, y0, z0, x1, y1, z1, ...]"""
-    row = [gesture_label]
+def landmarks_to_row(hand_landmarks, gesture_label, clip_id):
+    """Flattens MediaPipe's 21 hand landmarks into a single row: [label, clip_id, x0, y0, z0, ...]"""
+    row = [gesture_label, clip_id]
     for lm in hand_landmarks.landmark:
         row.extend([lm.x, lm.y, lm.z])
     return row
 
 
-def process_video(video_path, gesture_label, hands, writer):
+def process_video(video_path, gesture_label, clip_id, hands, writer):
     """Runs MediaPipe on every frame of one video, writes a row per frame with a detected hand."""
     cap = cv2.VideoCapture(video_path)
     frames_written = 0
@@ -50,7 +54,7 @@ def process_video(video_path, gesture_label, hands, writer):
         if results.multi_hand_landmarks:
             # Only use the first detected hand (we only expect one hand in frame)
             hand_landmarks = results.multi_hand_landmarks[0]
-            row = landmarks_to_row(hand_landmarks, gesture_label)
+            row = landmarks_to_row(hand_landmarks, gesture_label, clip_id)
             writer.writerow(row)
             frames_written += 1
 
@@ -59,8 +63,8 @@ def process_video(video_path, gesture_label, hands, writer):
 
 
 def build_header():
-    """Column names: label, then lm0_x, lm0_y, lm0_z, lm1_x, ... for all 21 landmarks."""
-    header = ["gesture"]
+    """Column names: label, clip_id, then lm0_x, lm0_y, lm0_z, lm1_x, ... for all 21 landmarks."""
+    header = ["gesture", "clip_id"]
     for i in range(21):
         header.extend([f"lm{i}_x", f"lm{i}_y", f"lm{i}_z"])
     return header
@@ -97,7 +101,9 @@ def main():
 
                 for video_file in video_files:
                     video_path = os.path.join(gesture_dir, video_file)
-                    frames_written = process_video(video_path, gesture, hands, writer)
+                    # clip_id uniquely identifies this video, e.g. "fist/fist_01_1234567890.avi"
+                    clip_id = f"{gesture}/{video_file}"
+                    frames_written = process_video(video_path, gesture, clip_id, hands, writer)
                     total_frames += frames_written
                     print(f"  {video_file}: {frames_written} frames with a detected hand")
 
