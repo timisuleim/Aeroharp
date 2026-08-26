@@ -15,11 +15,14 @@ GPU) actually reads to drive Magenta RealTime 2's offline inference --
 this script itself does NOT run MRT2, since that needs a GPU this laptop
 doesn't have.
 
+Output filename is derived from the input video's filename, so running
+this on multiple clips doesn't overwrite previous results.
+
 Usage:
     python map_to_mrt2.py path/to/some_gesture_video.avi
 
 Output:
-    control_sequence.json
+    <video_name>_control_sequence.json
 """
 
 import sys
@@ -31,7 +34,6 @@ import json
 import os
 
 MODEL_PATH = "../classifier/model.pkl"
-OUTPUT_FILE = "control_sequence.json"
 
 # Maps each discrete gesture to a text style prompt MRT2 can condition on.
 # Edit these to taste -- this is the actual "creative" mapping decision of the project.
@@ -108,6 +110,10 @@ def main():
         print(f"Video not found: {video_path}")
         return
 
+    # Derive output filename from the input video, so different clips don't
+    # overwrite each other's control_sequence.json
+    output_file = os.path.splitext(os.path.basename(video_path))[0] + "_control_sequence.json"
+
     clf = load_classifier()
 
     cap = cv2.VideoCapture(video_path)
@@ -159,11 +165,11 @@ def main():
 
     cap.release()
 
-    with open(OUTPUT_FILE, "w") as f:
+    with open(output_file, "w") as f:
         json.dump(control_events, f, indent=2)
 
     print(f"Processed {frame_index} frames, {len(control_events)} had a detected hand.")
-    print(f"Saved control sequence to {OUTPUT_FILE}")
+    print(f"Saved control sequence to {output_file}")
 
 
 if __name__ == "__main__":
