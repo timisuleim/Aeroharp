@@ -9,6 +9,14 @@ RealTime 2:
     - continuous hand openness     -> intensity (0-127, like a MIDI CC value)
     - continuous hand height       -> pitch (mapped to a MIDI note range)
 
+A temporal smoothing pass is applied to the raw per-frame gesture predictions
+before assigning style prompts: each frame's gesture is replaced with the
+majority vote across a small surrounding window. Frame-by-frame classification
+has no memory, so a single noisy frame (mid-transition, odd angle, etc.) can
+briefly "flip" to a different predicted gesture and back -- smoothing collapses
+these flickers into the surrounding, intended gesture instead of letting them
+spawn spurious short segments in generate.py.
+
 The output is a JSON file listing one control event per frame, with a
 timestamp. This file is what mrt2_runner/generate.py (running on a cloud
 GPU) actually reads to drive Magenta RealTime 2's offline inference --
@@ -32,6 +40,7 @@ import numpy as np
 import pickle
 import json
 import os
+from collections import Counter
 
 MODEL_PATH = "../classifier/model.pkl"
 
@@ -47,6 +56,12 @@ STYLE_MAP = {
 # MIDI note range that hand height gets mapped onto (low hand -> low note, high hand -> high note)
 MIDI_NOTE_MIN = 48   # roughly C3
 MIDI_NOTE_MAX = 84   # roughly C6
+
+# Temporal smoothing: each frame's gesture becomes the majority vote across
+# this many frames centered on it (must be odd). At 20fps, 5 frames = 0.25s --
+# short enough to preserve real gesture changes, long enough to kill 1-2 frame
+# flicker noise.
+SMOOTHING_WINDOW = 5
 
 mp_hands = mp.solutions.hands
 
@@ -100,6 +115,28 @@ def scale(value, in_min, in_max, out_min, out_max):
     return out_min + scaled * (out_max - out_min)
 
 
+def smooth_gestures(raw_gestures, window):
+    """
+    Replaces each entry in raw_gestures with the majority vote across a
+    window of size `window` centered on it (clipped at the sequence edges).
+    raw_gestures is a plain list of gesture label strings, one per
+    hand-detected frame (NOT one per video frame -- gaps where no hand was
+    detected are simply absent, so this smooths over detected frames only).
+    """
+    n = len(raw_gestures)
+    half = window // 2
+    smoothed = []
+
+    for i in range(n):
+        start = max(0, i - half)
+        end = min(n, i + half + 1)
+        window_slice = raw_gestures[start:end]
+        majority = Counter(window_slice).most_common(1)[0][0]
+        smoothed.append(majority)
+
+    return smoothed
+
+
 def main():
     if len(sys.argv) < 2:
         print("Usage: python map_to_mrt2.py path/to/gesture_video.avi")
@@ -119,7 +156,10 @@ def main():
     cap = cv2.VideoCapture(video_path)
     fps = cap.get(cv2.CAP_PROP_FPS) or 20  # fall back to 20 if the video doesn't report FPS
 
-    control_events = []
+    # First pass: collect raw per-detected-frame data (gesture, openness,
+    # height, frame_index, time) WITHOUT assigning style prompts yet -- we
+    # need the whole sequence before we can smooth it.
+    raw_frames = []
     frame_index = 0
 
     with mp_hands.Hands(
@@ -140,23 +180,19 @@ def main():
             if results.multi_hand_landmarks:
                 hand_landmarks = results.multi_hand_landmarks[0]
 
-                # Discrete gesture -> style prompt
                 feature_vector = landmarks_to_feature_vector(hand_landmarks)
                 predicted_gesture = clf.predict([feature_vector])[0]
-                style_prompt = STYLE_MAP.get(predicted_gesture, "ambient")
 
-                # Continuous features -> MIDI-style control values
                 openness = compute_hand_openness(hand_landmarks)
                 height = compute_hand_height(hand_landmarks)
 
-                intensity = round(scale(openness, 0.05, 0.35, 0, 127))  # rough openness range, tune after testing
+                intensity = round(scale(openness, 0.05, 0.35, 0, 127))
                 pitch = round(scale(height, 0.0, 1.0, MIDI_NOTE_MIN, MIDI_NOTE_MAX))
 
-                control_events.append({
+                raw_frames.append({
                     "frame": frame_index,
                     "time_seconds": round(frame_index / fps, 3),
-                    "gesture": predicted_gesture,
-                    "style_prompt": style_prompt,
+                    "raw_gesture": predicted_gesture,
                     "pitch_midi": pitch,
                     "intensity": intensity,
                 })
@@ -165,10 +201,29 @@ def main():
 
     cap.release()
 
+    # Second pass: smooth the gesture sequence, then assign style prompts
+    # based on the SMOOTHED gesture, not the raw per-frame prediction.
+    raw_gesture_list = [f["raw_gesture"] for f in raw_frames]
+    smoothed_gesture_list = smooth_gestures(raw_gesture_list, SMOOTHING_WINDOW)
+
+    flips_corrected = sum(1 for r, s in zip(raw_gesture_list, smoothed_gesture_list) if r != s)
+
+    control_events = []
+    for raw, smoothed_gesture in zip(raw_frames, smoothed_gesture_list):
+        control_events.append({
+            "frame": raw["frame"],
+            "time_seconds": raw["time_seconds"],
+            "gesture": smoothed_gesture,
+            "style_prompt": STYLE_MAP.get(smoothed_gesture, "ambient"),
+            "pitch_midi": raw["pitch_midi"],
+            "intensity": raw["intensity"],
+        })
+
     with open(output_file, "w") as f:
         json.dump(control_events, f, indent=2)
 
     print(f"Processed {frame_index} frames, {len(control_events)} had a detected hand.")
+    print(f"Smoothing (window={SMOOTHING_WINDOW}) changed {flips_corrected}/{len(control_events)} frame predictions.")
     print(f"Saved control sequence to {output_file}")
 
 
